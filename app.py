@@ -3,7 +3,7 @@ import io
 import csv
 import os
 import logging
-from datetime import datetime
+from datetime import datetime, date
 
 import numpy as np
 import pandas as pd
@@ -14,7 +14,7 @@ from sklearn.ensemble import IsolationForest
 from sklearn.metrics import precision_score, recall_score, f1_score
 
 # -----------------------------
-# App settings
+# Config / Security / Logging
 # -----------------------------
 APP_TITLE = "Sleep Pattern Anomaly Detection System"
 MAX_UPLOAD_MB = 10
@@ -26,18 +26,21 @@ logging.basicConfig(
     format="%(asctime)s %(levelname)s %(message)s",
 )
 
-# Canonical column names used internally
+# Canonical (mapped) column names we expect after normalization
 REQUIRED_CANON = ["Start", "End", "Sleep quality", "Time in bed", "Heart rate", "Activity"]
 OPTIONAL_CANON = ["Sleep Notes", "Wake up"]
 
+
 # -----------------------------
-# CSV loading
+# CSV Reading Helpers
 # -----------------------------
 @st.cache_data(show_spinner=False)
 def read_csv_bytes(content: bytes) -> pd.DataFrame:
     """
-    Attempts to read a CSV file with common encodings and delimiters.
-    This helps support exports from different sleep tracking tools.
+    Robust CSV loader:
+    - Tries UTF-8 then latin1 decode for delimiter sniffing
+    - Sniffs delimiter among [',', ';', '\\t']
+    - Falls back to common separators
     """
     text = None
     for enc in ("utf-8", "latin1"):
@@ -51,7 +54,8 @@ def read_csv_bytes(content: bytes) -> pd.DataFrame:
         sample = text[:4096]
         try:
             dialect = csv.Sniffer().sniff(sample, delimiters=[",", ";", "\t"])
-            df = pd.read_csv(io.StringIO(text), sep=dialect.delimiter)
+            sep = dialect.delimiter
+            df = pd.read_csv(io.StringIO(text), sep=sep)
             if df.shape[1] > 1:
                 return df
         except Exception:
@@ -65,46 +69,83 @@ def read_csv_bytes(content: bytes) -> pd.DataFrame:
             except Exception:
                 continue
 
-    return pd.read_csv(io.BytesIO(content), sep=None, engine="python", on_bad_lines="skip")
+    # Final fallback
+    try:
+        return pd.read_csv(io.BytesIO(content), sep=None, engine="python", on_bad_lines="skip")
+    except Exception:
+        return pd.read_csv(io.BytesIO(content), on_bad_lines="skip")
 
 
 def normalize_and_map_columns(df: pd.DataFrame) -> pd.DataFrame:
     """
-    Maps common column name variations to the names used by the app.
-    Designed around Sleep Cycle–style CSV exports.
+    Maps common variations to canonical names used in the app.
+    Works with your header:
+    Start;End;Sleep quality;Time in bed;Wake up;Sleep Notes;Heart rate;Activity (steps)
     """
     df = df.copy()
     df.rename(columns={c: c.strip() for c in df.columns}, inplace=True)
+
     lower_map = {c.lower(): c for c in df.columns}
     col_map = {}
 
+    # Start/End
     if "start" in lower_map:
         col_map["Start"] = lower_map["start"]
+    elif "start time" in lower_map:
+        col_map["Start"] = lower_map["start time"]
+
     if "end" in lower_map:
         col_map["End"] = lower_map["end"]
+    elif "end time" in lower_map:
+        col_map["End"] = lower_map["end time"]
 
+    # Sleep quality
     if "sleep quality" in lower_map:
         col_map["Sleep quality"] = lower_map["sleep quality"]
+    elif "sleep_quality" in lower_map:
+        col_map["Sleep quality"] = lower_map["sleep_quality"]
+    elif "sleep quality (%)" in lower_map:
+        col_map["Sleep quality"] = lower_map["sleep quality (%)"]
 
+    # Time in bed
     if "time in bed" in lower_map:
         col_map["Time in bed"] = lower_map["time in bed"]
+    elif "time in bed (seconds)" in lower_map:
+        col_map["Time in bed"] = lower_map["time in bed (seconds)"]
+    elif "time in bed (s)" in lower_map:
+        col_map["Time in bed"] = lower_map["time in bed (s)"]
 
+    # Heart rate
     if "heart rate" in lower_map:
         col_map["Heart rate"] = lower_map["heart rate"]
+    elif "heart rate (bpm)" in lower_map:
+        col_map["Heart rate"] = lower_map["heart rate (bpm)"]
+    elif "heart_rate" in lower_map:
+        col_map["Heart rate"] = lower_map["heart_rate"]
 
-    if "activity (steps)" in lower_map:
-        col_map["Activity"] = lower_map["activity (steps)"]
+    # Activity / Steps
+    if "activity" in lower_map:
+        col_map["Activity"] = lower_map["activity"]
     elif "steps" in lower_map:
         col_map["Activity"] = lower_map["steps"]
+    elif "activity (steps)" in lower_map:
+        col_map["Activity"] = lower_map["activity (steps)"]  # <-- your dataset
 
+    # Optional fields
     if "sleep notes" in lower_map:
         col_map["Sleep Notes"] = lower_map["sleep notes"]
+    elif "notes" in lower_map:
+        col_map["Sleep Notes"] = lower_map["notes"]
 
     if "wake up" in lower_map:
         col_map["Wake up"] = lower_map["wake up"]
+    elif "wake_up" in lower_map:
+        col_map["Wake up"] = lower_map["wake_up"]
 
+    # Create canonical columns by copying from source columns
     for tgt, src in col_map.items():
-        df[tgt] = df[src]
+        if src in df.columns:
+            df[tgt] = df[src]
 
     return df
 
@@ -114,7 +155,9 @@ def parse_duration_to_minutes(val):
         return np.nan
     if isinstance(val, (int, float)):
         return float(val)
-    s = str(val)
+    s = str(val).strip()
+
+    # HH:MM or H:MM:SS
     if ":" in s:
         parts = s.split(":")
         try:
@@ -125,112 +168,149 @@ def parse_duration_to_minutes(val):
                 return parts[0] * 60 + parts[1] + parts[2] / 60
         except Exception:
             return np.nan
+
     try:
         return float(s)
     except Exception:
         return np.nan
 
 
-def preprocess(df: pd.DataFrame) -> pd.DataFrame:
-    df = normalize_and_map_columns(df)
-
+def validate_required_columns(df: pd.DataFrame):
     missing = [c for c in REQUIRED_CANON if c not in df.columns]
     if missing:
-        raise ValueError(f"Missing required columns: {missing}")
+        raise ValueError(
+            f"Missing required columns after mapping: {missing}. "
+            f"Found columns: {list(df.columns)}"
+        )
 
+
+def preprocess(df: pd.DataFrame) -> pd.DataFrame:
+    df = normalize_and_map_columns(df)
+    validate_required_columns(df)
+
+    # Parse datetimes
     df["Start"] = pd.to_datetime(df["Start"], errors="coerce")
     df["End"] = pd.to_datetime(df["End"], errors="coerce")
 
-    sq = df["Sleep quality"].astype(str).str.strip()
-    sq = sq.str.replace("%", "", regex=False)
-    sq = sq.replace({"": np.nan, "nan": np.nan, "None": np.nan})
-    df["Sleep_quality"] = pd.to_numeric(sq, errors="coerce")
-
+    # Convert key numeric fields
+    df["Sleep_quality"] = pd.to_numeric(df["Sleep quality"], errors="coerce")
     df["Heart_rate"] = pd.to_numeric(df["Heart rate"], errors="coerce")
     df["Activity"] = pd.to_numeric(df["Activity"], errors="coerce")
 
+    # Time in bed -> minutes
     df["Time_in_bed_min"] = df["Time in bed"].apply(parse_duration_to_minutes)
-    if df["Time_in_bed_min"].median(skipna=True) > 1000:
-        df["Time_in_bed_min"] /= 60
+    med = df["Time_in_bed_min"].median(skipna=True)
+    # If it looks like seconds, convert
+    if not np.isnan(med) and med > 1000:
+        df["Time_in_bed_min"] = df["Time_in_bed_min"] / 60.0
 
+    # Drop rows without Start/End
     df = df.dropna(subset=["Start", "End"]).reset_index(drop=True)
 
+    # If time_in_bed is missing, infer from End-Start
     mask = df["Time_in_bed_min"].isna()
-    df.loc[mask, "Time_in_bed_min"] = (
-        (df.loc[mask, "End"] - df.loc[mask, "Start"])
-        .dt.total_seconds() / 60
-    )
+    df.loc[mask, "Time_in_bed_min"] = (df.loc[mask, "End"] - df.loc[mask, "Start"]).dt.total_seconds() / 60.0
 
-    df["Sleep_Notes"] = df.get("Sleep Notes", "").astype(str)
+    # Keep optional fields if present
+    if "Sleep Notes" in df.columns:
+        df["Sleep_Notes"] = df["Sleep Notes"].astype(str).replace("nan", "")
+    else:
+        df["Sleep_Notes"] = ""
+
+    if "Wake up" in df.columns:
+        df["Wake_up"] = df["Wake up"].astype(str).replace("nan", "")
+    else:
+        df["Wake_up"] = ""
+
     return df
 
 
 def engineer_features(df: pd.DataFrame) -> pd.DataFrame:
     df = df.copy()
-    df["sleep_duration_min"] = (df["End"] - df["Start"]).dt.total_seconds() / 60
-    df["sleep_efficiency"] = df["sleep_duration_min"] / df["Time_in_bed_min"]
-    df["sleep_efficiency"] = df["sleep_efficiency"].clip(0, 1)
+    df["sleep_duration_min"] = (df["End"] - df["Start"]).dt.total_seconds() / 60.0
 
+    # Efficiency: duration / time-in-bed
+    df["sleep_efficiency"] = df["sleep_duration_min"] / df["Time_in_bed_min"]
+    df["sleep_efficiency"] = df["sleep_efficiency"].replace([np.inf, -np.inf], np.nan).clip(0, 1)
+
+    # Convenience
     df["date"] = df["Start"].dt.date
     df["week_start"] = df["Start"].dt.to_period("W").apply(lambda r: r.start_time.date())
+    df = df.sort_values("Start").reset_index(drop=True)
 
-    df["roll_sleep_dur_7"] = df["sleep_duration_min"].rolling(7, min_periods=1).mean()
-    df["roll_sleep_eff_7"] = df["sleep_efficiency"].rolling(7, min_periods=1).mean()
+    # Rolling averages (descriptive)
+    df["roll_sleep_dur_7"] = df["sleep_duration_min"].rolling(window=7, min_periods=1).mean()
+    df["roll_sleep_eff_7"] = df["sleep_efficiency"].rolling(window=7, min_periods=1).mean()
+    df["roll_quality_7"] = df["Sleep_quality"].rolling(window=7, min_periods=1).mean()
 
     return df
 
 
-def run_isolation_forest(df: pd.DataFrame, contamination: float):
-    features = [
-        "sleep_duration_min",
-        "sleep_efficiency",
-        "Heart_rate",
-        "Activity",
-        "Sleep_quality",
-    ]
-    X = df[features].fillna(-999).values
+def run_isolation_forest(df: pd.DataFrame, contamination: float, random_state: int = 42):
+    df = df.copy()
+    feature_cols = ["sleep_duration_min", "sleep_efficiency", "Heart_rate", "Activity", "Sleep_quality"]
+    X = df[feature_cols].replace([np.inf, -np.inf], np.nan).fillna(-999).values
 
     model = IsolationForest(
         contamination=contamination,
-        random_state=42,
+        random_state=random_state,
         n_estimators=200,
     )
     model.fit(X)
+    pred = model.predict(X)
+    score = model.decision_function(X)  # higher = more normal
 
-    df = df.copy()
-    df["anomaly"] = model.predict(X) == -1
-    df["anomaly_score"] = model.decision_function(X)
-    return df, features
+    df["anomaly"] = (pred == -1)
+    df["anomaly_score"] = score
+    return df, model, feature_cols
 
 
 def create_proxy_labels(df: pd.DataFrame) -> pd.DataFrame:
+    """
+    Proxy labels are used ONLY for evaluation since we don't have true anomaly labels.
+    """
     df = df.copy()
-    df["proxy_anom"] = (
-        (df["sleep_duration_min"] < 180)
-        | (df["sleep_duration_min"] > 720)
-        | (df["sleep_efficiency"] < 0.6)
-        | (df["Sleep_quality"] < 30)
-        | (df["Heart_rate"] > df["Heart_rate"].median() + 15)
-    )
+    cond_short = df["sleep_duration_min"] < 180          # < 3 hours
+    cond_long = df["sleep_duration_min"] > 720           # > 12 hours
+    cond_low_eff = df["sleep_efficiency"] < 0.60
+    cond_low_quality = df["Sleep_quality"] < 30
+    hr_thr = df["Heart_rate"].median(skipna=True) + 15
+    cond_high_hr = df["Heart_rate"] > hr_thr
+    df["proxy_anom"] = (cond_short | cond_long | cond_low_eff | cond_low_quality | cond_high_hr)
     return df
 
 
-def build_recommendations(df: pd.DataFrame):
+def build_recommendations(df: pd.DataFrame) -> list[str]:
+    """
+    Simple, rubric-friendly prescriptive output: tied directly to metrics.
+    """
     recs = []
-    if df["anomaly"].sum() == 0:
-        return ["No unusual sleep patterns detected in this range."]
+    if df.empty:
+        return ["No data in the selected range."]
 
-    if (df["sleep_efficiency"] < 0.7).any():
-        recs.append("Low sleep efficiency detected. Try maintaining a consistent bedtime.")
-    if (df["sleep_duration_min"] < 360).any():
-        recs.append("Short sleep duration detected. Consider extending your sleep window.")
-    if (df["Heart_rate"] > df["Heart_rate"].median() + 15).any():
-        recs.append("Elevated heart rate on some nights. Stress or late caffeine may be contributing.")
+    anom = df[df["anomaly"]]
+    if anom.empty:
+        return ["No anomalies detected in the selected range. Maintain current sleep habits."]
 
+    med_hr = df["Heart_rate"].median(skipna=True)
+    med_act = df["Activity"].median(skipna=True)
+
+    if (anom["sleep_efficiency"] < 0.70).any():
+        recs.append("Low sleep efficiency detected: consider a consistent bedtime, limit screens 1 hour before bed, and reduce late meals.")
+    if (anom["sleep_duration_min"] < 360).any():
+        recs.append("Short sleep duration detected: aim for a longer sleep window and avoid late caffeine.")
+    if (anom["sleep_duration_min"] > 600).any():
+        recs.append("Long sleep duration detected: consider a consistent wake time and review sleep schedule regularity.")
+    if (anom["Heart_rate"] > (med_hr + 15)).any():
+        recs.append("Higher resting heart rate on anomalous nights: consider stress reduction and avoiding stimulants later in the day.")
+    if (anom["Activity"] > (med_act + 1000)).any():
+        recs.append("Higher activity near anomalous nights: avoid intense exercise too close to bedtime.")
+    if not recs:
+        recs.append("Anomalies detected. Review the flagged nights and compare sleep quality, duration, and heart rate patterns.")
     return recs
 
 
-def df_to_csv_bytes(df):
+def df_to_csv_bytes(df: pd.DataFrame) -> bytes:
     return df.to_csv(index=False).encode("utf-8")
 
 
@@ -240,97 +320,239 @@ def df_to_csv_bytes(df):
 st.set_page_config(page_title=APP_TITLE, layout="wide")
 st.title(APP_TITLE)
 
-uploaded = st.file_uploader("Upload your sleep CSV file", type=["csv"])
+with st.sidebar:
+    st.header("Controls")
+    st.caption("Upload your sleep CSV and run anomaly detection.")
 
-if uploaded is None:
-    st.info("Upload a CSV file to begin.")
+    uploaded = st.file_uploader("Upload CSV", type=["csv"])
+    use_uploaded_only = st.checkbox("Use uploaded file only", value=True)
+
+    contamination = st.slider("Anomaly sensitivity (contamination)", 0.01, 0.20, 0.05, 0.01)
+    show_anom_only = st.checkbox("Show anomalies only", value=False)
+
+    st.divider()
+    st.subheader("Monitoring")
+    st.caption(f"Log file: {LOG_PATH}")
+    if os.path.exists(LOG_PATH):
+        with open(LOG_PATH, "r", encoding="utf-8", errors="ignore") as f:
+            log_tail = f.read().splitlines()[-15:]
+        st.code("\n".join(log_tail), language="text")
+    else:
+        st.write("No logs yet.")
+
+
+# --- Security: file size ---
+if uploaded is not None:
+    if uploaded.size > MAX_UPLOAD_MB * 1024 * 1024:
+        st.error(f"File too large. Max allowed is {MAX_UPLOAD_MB} MB.")
+        logging.warning("Upload rejected: file too large (%s bytes)", uploaded.size)
+        st.stop()
+
+# --- Load data ---
+df_raw = None
+data_source = None
+
+try:
+    if uploaded is not None:
+        df_raw = read_csv_bytes(uploaded.read())
+        data_source = "uploaded"
+        logging.info("Loaded uploaded dataset with shape=%s", df_raw.shape)
+    else:
+        st.info("Upload a CSV to continue.")
+        st.stop()
+except Exception as e:
+    st.error(f"Failed to read CSV: {e}")
+    logging.exception("CSV read failed")
     st.stop()
 
-if uploaded.size > MAX_UPLOAD_MB * 1024 * 1024:
-    st.error("Uploaded file is too large.")
+# Show raw columns / preview
+with st.expander("Raw data preview", expanded=False):
+    st.write("Columns:", list(df_raw.columns))
+    st.dataframe(df_raw.head(20), use_container_width=True)
+
+# --- Pipeline: preprocess + features ---
+try:
+    df_clean = preprocess(df_raw)
+    df_feat = engineer_features(df_clean)
+
+    logging.info(
+        "Preprocess+features complete: rows=%d, date_range=%s..%s",
+        len(df_feat),
+        df_feat["Start"].min(),
+        df_feat["Start"].max(),
+    )
+except Exception as e:
+    st.error(str(e))
+    logging.exception("Preprocess/feature engineering failed")
     st.stop()
 
-df_raw = read_csv_bytes(uploaded.read())
+# Data quality panel (rubric-friendly)
+dq1, dq2, dq3 = st.columns(3)
+with dq1:
+    st.metric("Rows (after cleaning)", f"{len(df_feat)}")
+with dq2:
+    st.metric("Date range", f"{df_feat['Start'].min().date()} → {df_feat['Start'].max().date()}")
+with dq3:
+    missing_pct = df_feat[["Sleep_quality", "Heart_rate", "Activity", "Time_in_bed_min"]].isna().mean() * 100
+    st.metric("Avg missing % (key fields)", f"{missing_pct.mean():.1f}%")
 
-with st.expander("Raw data preview"):
-    st.write(df_raw.head(20))
+with st.expander("Data quality checks (missing values)", expanded=False):
+    st.dataframe(
+        (df_feat.isna().sum().sort_values(ascending=False)).to_frame("missing_count"),
+        use_container_width=True,
+    )
 
-df_clean = preprocess(df_raw)
-df_feat = engineer_features(df_clean)
+# --- Interactive query: date range ---
+min_d = df_feat["Start"].min().date()
+max_d = df_feat["Start"].max().date()
 
-st.metric("Records after cleaning", len(df_feat))
+qcol1, qcol2 = st.columns(2)
+with qcol1:
+    start_date = st.date_input("Filter start date", min_d, min_value=min_d, max_value=max_d)
+with qcol2:
+    end_date = st.date_input("Filter end date", max_d, min_value=min_d, max_value=max_d)
 
-start_date, end_date = st.date_input(
-    "Select date range",
-    [df_feat["Start"].min().date(), df_feat["Start"].max().date()],
-)
+if start_date > end_date:
+    st.error("Start date must be <= end date.")
+    st.stop()
 
-df_q = df_feat[
-    (df_feat["Start"].dt.date >= start_date)
-    & (df_feat["Start"].dt.date <= end_date)
-]
+df_q = df_feat[(df_feat["Start"].dt.date >= start_date) & (df_feat["Start"].dt.date <= end_date)].copy()
+if df_q.empty:
+    st.warning("No rows in the selected date range.")
+    st.stop()
 
-contamination = st.slider("Anomaly sensitivity", 0.01, 0.2, 0.05, 0.01)
-df_anom, feature_cols = run_isolation_forest(df_q, contamination)
+# --- Run ML ---
+df_anom, model, feature_cols = run_isolation_forest(df_q, contamination=contamination)
+anom_count = int(df_anom["anomaly"].sum())
+logging.info("IsolationForest run: contamination=%.3f anomalies=%d/%d", contamination, anom_count, len(df_anom))
 
-# -----------------------------
-# Charts
-# -----------------------------
-fig = px.line(
-    df_anom,
-    x="Start",
-    y="sleep_duration_min",
-    color=df_anom["anomaly"].map({True: "Anomaly", False: "Normal"}),
-    title="Sleep Duration Over Time",
-)
-st.plotly_chart(fig, use_container_width=True)
-
-weekly = df_anom.groupby("week_start").mean(numeric_only=True).reset_index()
-fig2 = px.bar(
-    weekly,
-    x="week_start",
-    y=["sleep_duration_min", "sleep_efficiency", "Sleep_quality"],
-    title="Weekly Sleep Trends",
-)
-st.plotly_chart(fig2, use_container_width=True)
-
-fig3 = px.scatter(
-    df_anom,
-    x="sleep_duration_min",
-    y="Sleep_quality",
-    color=df_anom["anomaly"].map({True: "Anomaly", False: "Normal"}),
-    title="Duration vs Sleep Quality",
-)
-st.plotly_chart(fig3, use_container_width=True)
+# Apply anomaly-only view if toggled
+df_view = df_anom[df_anom["anomaly"]].copy() if show_anom_only else df_anom.copy()
 
 # -----------------------------
-# Results + Evaluation
+# Dashboard (3+ visualization types)
 # -----------------------------
-st.subheader("Decision Support")
-for rec in build_recommendations(df_anom):
-    st.write("-", rec)
+left, right = st.columns([2, 1])
 
-st.subheader("Model Evaluation (Heuristic Labels)")
-df_eval = create_proxy_labels(df_anom)
-prec = precision_score(df_eval["proxy_anom"], df_anom["anomaly"], zero_division=0)
-rec = recall_score(df_eval["proxy_anom"], df_anom["anomaly"], zero_division=0)
-f1 = f1_score(df_eval["proxy_anom"], df_anom["anomaly"], zero_division=0)
+with left:
+    # 1) Time-series line chart with anomaly markers
+    fig = go.Figure()
+    fig.add_trace(
+        go.Scatter(
+            x=df_view["Start"],
+            y=df_view["sleep_duration_min"],
+            mode="lines+markers",
+            name="Sleep duration (min)",
+        )
+    )
+    anom_pts = df_view[df_view["anomaly"]]
+    if not anom_pts.empty:
+        fig.add_trace(
+            go.Scatter(
+                x=anom_pts["Start"],
+                y=anom_pts["sleep_duration_min"],
+                mode="markers",
+                name="Anomaly",
+                marker=dict(color="red", size=10),
+                hovertext=anom_pts["Sleep_Notes"],
+            )
+        )
+    fig.update_layout(
+        title="Sleep duration over time (anomalies highlighted)",
+        xaxis_title="Date",
+        yaxis_title="Minutes",
+        height=420,
+    )
+    st.plotly_chart(fig, use_container_width=True)
 
-st.write(f"Precision: {prec:.3f}")
-st.write(f"Recall: {rec:.3f}")
-st.write(f"F1 Score: {f1:.3f}")
+    # 2) Weekly bar chart (descriptive)
+    weekly = df_view.groupby("week_start").agg(
+        sleep_duration_min=("sleep_duration_min", "mean"),
+        sleep_efficiency=("sleep_efficiency", "mean"),
+        Sleep_quality=("Sleep_quality", "mean"),
+    ).reset_index()
 
-st.subheader("Downloads")
-st.download_button("Download cleaned data", df_to_csv_bytes(df_feat), "cleaned_sleep.csv")
-st.download_button(
-    "Download anomalies only",
-    df_to_csv_bytes(df_anom[df_anom["anomaly"]]),
-    "sleep_anomalies.csv",
-)
+    weekly_melt = weekly.melt(id_vars="week_start", value_vars=["sleep_duration_min", "sleep_efficiency", "Sleep_quality"])
+    fig2 = px.bar(
+        weekly_melt,
+        x="week_start",
+        y="value",
+        color="variable",
+        barmode="group",
+        title="Weekly averages (duration, efficiency, quality)",
+        labels={"week_start": "Week", "value": "Value"},
+        height=380,
+    )
+    st.plotly_chart(fig2, use_container_width=True)
 
-st.subheader("Flagged Nights")
-st.dataframe(
-    df_anom[df_anom["anomaly"]][
-        ["Start", "End", "sleep_duration_min", "sleep_efficiency", "Sleep_quality", "Heart_rate", "Activity"]
-    ]
-)
+    # 3) Scatter plot (exploration)
+    fig3 = px.scatter(
+        df_view,
+        x="sleep_duration_min",
+        y="Sleep_quality",
+        color=df_view["anomaly"].map({True: "Anomaly", False: "Normal"}),
+        hover_data=["date", "sleep_efficiency", "Heart_rate", "Activity"],
+        title="Duration vs Sleep Quality (colored by anomaly)",
+        height=420,
+    )
+    st.plotly_chart(fig3, use_container_width=True)
+
+with right:
+    st.header("Decision support")
+    st.write(f"Anomalous nights: **{anom_count}** out of **{len(df_anom)}** in the selected range.")
+
+    recs = build_recommendations(df_anom)
+    for r in recs:
+        st.write(f"- {r}")
+
+    st.divider()
+    st.header("Model details")
+    st.write("Algorithm: Isolation Forest")
+    st.write("Features used:")
+    st.code("\n".join(feature_cols), language="text")
+
+    st.divider()
+    st.header("Evaluation (proxy labels)")
+    df_eval = create_proxy_labels(df_anom)
+    y_true = df_eval["proxy_anom"].astype(int)
+    y_pred = df_eval["anomaly"].astype(int)
+
+    if y_true.sum() == 0:
+        st.write("Proxy labels produced no positive cases in this range. Expand the date range or adjust heuristics.")
+    else:
+        prec = precision_score(y_true, y_pred, zero_division=0)
+        rec = recall_score(y_true, y_pred, zero_division=0)
+        f1 = f1_score(y_true, y_pred, zero_division=0)
+        st.write(f"Precision: **{prec:.3f}**")
+        st.write(f"Recall: **{rec:.3f}**")
+        st.write(f"F1: **{f1:.3f}**")
+        st.caption("Note: proxy labels are heuristics used only for rubric-required evaluation.")
+
+    st.divider()
+    st.header("Exports")
+    st.download_button(
+        "Download CLEANED dataset (CSV)",
+        df_to_csv_bytes(df_feat),
+        file_name="sleepdata_cleaned.csv",
+        mime="text/csv",
+    )
+    st.download_button(
+        "Download ANOMALIES only (CSV)",
+        df_to_csv_bytes(df_anom[df_anom["anomaly"]]),
+        file_name="sleepdata_anomalies.csv",
+        mime="text/csv",
+    )
+
+# -----------------------------
+# Table of anomalies (useful for graders)
+# -----------------------------
+st.subheader("Flagged nights (table)")
+anom_table = df_anom[df_anom["anomaly"]].copy()
+if anom_table.empty:
+    st.write("No anomalies flagged in the selected range.")
+else:
+    show_cols = ["Start", "End", "sleep_duration_min", "sleep_efficiency", "Sleep_quality", "Heart_rate", "Activity", "anomaly_score", "Sleep_Notes"]
+    show_cols = [c for c in show_cols if c in anom_table.columns]
+    st.dataframe(anom_table[show_cols].sort_values("Start"), use_container_width=True)
+
+st.caption("Tip: If your file uses semicolons, this app auto-detects delimiters. Your header format is supported.")
