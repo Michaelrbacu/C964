@@ -110,6 +110,11 @@ def preprocess(df: pd.DataFrame) -> pd.DataFrame:
         df['Start'] = pd.to_datetime(df['Start'], errors='coerce')
     if 'End' in df.columns:
         df['End'] = pd.to_datetime(df['End'], errors='coerce')
+
+    # Ensure required datetime columns exist
+    missing_dt = [c for c in ['Start', 'End'] if c not in df.columns]
+    if missing_dt:
+        raise ValueError(f"Missing required datetime column(s): {', '.join(missing_dt)}. Available columns: {list(df.columns)}")
     # Time in bed
     if 'Time in bed' in df.columns:
         df['Time_in_bed_min'] = df['Time in bed'].apply(parse_duration_to_minutes)
@@ -205,9 +210,13 @@ st.write('Raw columns:', list(df.columns))
 
 # Preprocess
 if st.button('Run Preprocessing'):
-    df = preprocess(df)
-    st.session_state['df'] = df
-    st.success(f'Preprocessing complete. Rows: {len(df)}')
+    try:
+        df = preprocess(df)
+        st.session_state['df'] = df
+        st.success(f'Preprocessing complete. Rows: {len(df)}')
+    except Exception as e:
+        st.error(f'Preprocessing failed: {e}')
+        st.stop()
 
 if 'df' not in st.session_state:
     st.warning('Run preprocessing to continue')
