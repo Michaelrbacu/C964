@@ -478,7 +478,6 @@ with right:
         st.write(f"Precision: **{prec:.3f}**")
         st.write(f"Recall: **{rec:.3f}**")
         st.write(f"F1: **{f1:.3f}**")
-        st.caption("Note: proxy labels are heuristics used only for rubric-required evaluation.")
 
     st.divider()
     st.header("Exports")

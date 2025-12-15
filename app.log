@@ -1,0 +1,3 @@
+2025-12-15 01:28:12,055 INFO Loaded sample dataset with shape=(887, 8)
+2025-12-15 01:28:12,128 INFO Preprocess+features complete: rows=887, date_range=2014-12-29 22:57:49..2018-02-16 22:52:29
+2025-12-15 01:28:12,447 INFO IsolationForest run: contamination=0.050 anomalies=45/887
