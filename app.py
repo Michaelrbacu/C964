@@ -156,7 +156,14 @@ def preprocess(df: pd.DataFrame) -> pd.DataFrame:
     df["Start"] = pd.to_datetime(df["Start"], errors="coerce")
     df["End"] = pd.to_datetime(df["End"], errors="coerce")
 
-    df["Sleep_quality"] = pd.to_numeric(df["Sleep quality"], errors="coerce")
+    if "Sleep quality" in df.columns:
+        s = df["Sleep quality"].astype(str).str.replace("%", "", regex=False).str.replace(",", ".")
+        df["Sleep_quality"] = pd.to_numeric(s, errors="coerce")
+        mx = df["Sleep_quality"].max(skipna=True)
+        if not np.isnan(mx) and mx <= 1.0:
+            df["Sleep_quality"] = df["Sleep_quality"] * 100.0
+    else:
+        df["Sleep_quality"] = np.nan
     df["Heart_rate"] = pd.to_numeric(df["Heart rate"], errors="coerce")
     df["Activity"] = pd.to_numeric(df["Activity"], errors="coerce")
 
