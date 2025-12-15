@@ -179,12 +179,13 @@ st.set_page_config(page_title='Sleep Anomaly Detection', layout='wide')
 st.title('Sleep Pattern Anomaly Detection System')
 
 uploaded = st.file_uploader('Upload a CSV file', type=['csv'])
-use_sample = st.checkbox('Use sample file from workspace (archive (3)/sleepdata_2.csv)')
+# default to using the provided sample in the workspace
+use_sample = st.checkbox('Use sample file from workspace (data/sleepdata.csv)', value=True)
 
 df = None
 if use_sample and uploaded is None:
     try:
-        with open('archive (3)/sleepdata_2.csv', 'rb') as f:
+        with open('data/sleepdata.csv', 'rb') as f:
             raw = f.read()
         df = read_csv_bytes(raw)
         st.success('Sample file loaded')
