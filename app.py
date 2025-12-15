@@ -373,21 +373,15 @@ if df_q.empty:
     st.warning("No rows in the selected date range.")
     st.stop()
 
-# --- Run ML ---
 df_anom, model, feature_cols = run_isolation_forest(df_q, contamination=contamination)
 anom_count = int(df_anom["anomaly"].sum())
 logging.info("IsolationForest run: contamination=%.3f anomalies=%d/%d", contamination, anom_count, len(df_anom))
 
-# Apply anomaly-only view if toggled
 df_view = df_anom[df_anom["anomaly"]].copy() if show_anom_only else df_anom.copy()
 
-# -----------------------------
-# Dashboard (3+ visualization types)
-# -----------------------------
 left, right = st.columns([2, 1])
 
 with left:
-    # 1) Time-series line chart with anomaly markers
     fig = go.Figure()
     fig.add_trace(
         go.Scatter(
@@ -417,7 +411,6 @@ with left:
     )
     st.plotly_chart(fig, use_container_width=True)
 
-    # 2) Weekly bar chart (descriptive)
     weekly = df_view.groupby("week_start").agg(
         sleep_duration_min=("sleep_duration_min", "mean"),
         sleep_efficiency=("sleep_efficiency", "mean"),
@@ -437,7 +430,6 @@ with left:
     )
     st.plotly_chart(fig2, use_container_width=True)
 
-    # 3) Scatter plot (exploration)
     fig3 = px.scatter(
         df_view,
         x="sleep_duration_min",
@@ -494,9 +486,6 @@ with right:
         mime="text/csv",
     )
 
-# -----------------------------
-# Table of anomalies (useful for graders)
-# -----------------------------
 st.subheader("Flagged nights (table)")
 anom_table = df_anom[df_anom["anomaly"]].copy()
 if anom_table.empty:
