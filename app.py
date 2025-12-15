@@ -141,7 +141,11 @@ def preprocess(df: pd.DataFrame) -> pd.DataFrame:
     df["Start"] = pd.to_datetime(df["Start"], errors="coerce")
     df["End"] = pd.to_datetime(df["End"], errors="coerce")
 
-    df["Sleep_quality"] = pd.to_numeric(df["Sleep quality"], errors="coerce")
+    sq = df["Sleep quality"].astype(str).str.strip()
+    sq = sq.str.replace("%", "", regex=False)
+    sq = sq.replace({"": np.nan, "nan": np.nan, "None": np.nan})
+    df["Sleep_quality"] = pd.to_numeric(sq, errors="coerce")
+
     df["Heart_rate"] = pd.to_numeric(df["Heart rate"], errors="coerce")
     df["Activity"] = pd.to_numeric(df["Activity"], errors="coerce")
 
