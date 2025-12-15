@@ -1,4 +1,5 @@
 import io
+import csv
 import math
 import pandas as pd
 import numpy as np
@@ -15,14 +16,44 @@ OPTIONAL_COLS = ['Sleep Notes']
 
 @st.cache_data
 def read_csv_bytes(content: bytes) -> pd.DataFrame:
-    # try common delimiters
-    for sep in [',', ';', '\t']:
+    # try to decode to text for sniffing
+    text = None
+    for enc in ('utf-8', 'latin1'):
         try:
-            return pd.read_csv(io.BytesIO(content), sep=sep)
+            text = content.decode(enc)
+            break
         except Exception:
             continue
-    # fallback
-    return pd.read_csv(io.BytesIO(content), on_bad_lines='skip')
+
+    # Use csv.Sniffer to detect delimiter when possible
+    if text is not None:
+        sample = text[:4096]
+        try:
+            dialect = csv.Sniffer().sniff(sample, delimiters=[',', ';', '\t'])
+            sep = dialect.delimiter
+            df = pd.read_csv(io.StringIO(text), sep=sep)
+            if df.shape[1] > 1:
+                return df
+        except Exception:
+            pass
+
+    # fallback: try common separators but ensure we get multiple columns
+    for sep in [',', ';', '\t']:
+        try:
+            if text is not None:
+                df = pd.read_csv(io.StringIO(text), sep=sep)
+            else:
+                df = pd.read_csv(io.BytesIO(content), sep=sep)
+            if df.shape[1] > 1:
+                return df
+        except Exception:
+            continue
+
+    # final fallback: let pandas attempt to infer
+    try:
+        return pd.read_csv(io.BytesIO(content), sep=None, engine='python', on_bad_lines='skip')
+    except Exception:
+        return pd.read_csv(io.BytesIO(content), on_bad_lines='skip')
 
 
 def normalize_and_map_columns(df: pd.DataFrame) -> pd.DataFrame:
